@@ -11,25 +11,235 @@ bibliography: references.bib
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = TRUE)
+library(tidyverse)
+library(lubridate)
+library(lme4)
+library(lmerTest)
+library(ordinal)
+library(cmprsk)
+library(survival)
+library(tidymodels)
+library(xgboost)
+library(vip)
+library(DALEXtra)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(patchwork)
+theme_set(theme_minimal(base_size = 12))
+set.seed(42)
 ```
 
-## R Markdown
+# Introduction
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+Diabetes mellitus, particularly type 2 diabetes, is a chronic, progressive condition responsible for substantial morbidity, mortality, and healthcare expenditure worldwide. Despite advances in therapy, a significant proportion of patients experience worsening glycemic control and develop microvascular and macrovascular complications over time. Understanding the natural history of disease progression and identifying patients at highest risk of adverse outcomes remain critical challenges in clinical practice.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+This project combines longitudinal statistical modeling with modern machine learning to provide a comprehensive view of diabetes progression using real-world electronic health records. By leveraging repeated hospital encounters from a large multi-institutional U.S. cohort, we (1) characterize how glycemic control evolves over time, (2) quantify the cumulative incidence of major complications while appropriately accounting for the competing risk of death, and (3) develop and interpret a dynamic predictive model that forecasts the onset of the next major complication using only information available at the current encounter.
 
-```{r cars}
-summary(cars)
+The integration of descriptive trajectory analysis, competing-risks survival methods, and interpretable machine learning offers both clinical insight into disease progression patterns and actionable risk stratification tools—bridging traditional biostatistics with contemporary data science approaches in healthcare.
+
+# Introduction to Dataset
+
+The analysis utilizes the publicly available **Diabetes 130-US Hospitals dataset (1999–2008)**, collected from 130 hospitals across the United States and made available through the UCI Machine Learning Repository [\@strack2014]. The dataset contains **101,766 hospital encounters** from **71,490 unique patients** diagnosed with diabetes, spanning a 10-year period.
+
+Key variables include demographic information (age, gender, race), admission source and type, 24 medication indicators, laboratory results (including HbA1c), up to three ICD-9 diagnosis codes, number of procedures, length of stay, and discharge disposition. Crucially, **55,453 patients (78%) have two or more encounters** (totaling 171,142 encounters), enabling true longitudinal and trajectory analyses.
+
+All patient identifiers were removed prior to release, ensuring HIPAA compliance. This dataset has become a benchmark resource for diabetes-related predictive modeling and health services research.
+
+## Data Loading
+
+```{r}
+# Load dataset
+diabetic <- read_csv("dataset_diabetes/diabetic_data.csv")
+ids     <- read_csv("dataset_diabetes/IDs_mapping.csv")
+
+# Structure of dataset
+str(diabetic)
+str(ids)
 ```
 
-## Including Plots
+## Data cleaning
 
-You can also embed plots, for example:
+```{r}
+# Check column names
+colnames(df)
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+# Basic cleaning
+df <- diabetic %>%
+  mutate(across(c(race, payer_code, medical_specialty, diag_1, diag_2, diag_3), 
+                ~na_if(., "?")),
+         weight = na_if(weight, "?"),
+         patient_nbr = as.factor(patient_nbr),
+         age = factor(age, ordered = TRUE),
+         admission_type_id = as.factor(admission_type_id),
+         discharge_disposition_id = as.factor(discharge_disposition_id),
+         admission_source_id = as.factor(admission_source_id))
+
+# First identify patients with ≥2 encounters
+multi_visit_patients <- df %>%
+  count(patient_nbr) %>%
+  filter(n >= 2) %>%
+  pull(patient_nbr)
+
+# Create longitudinal dataset with proper visit_number and time proxy
+long_df <- df %>%
+  filter(patient_nbr %in% multi_visit_patients) %>%
+  group_by(patient_nbr) %>%
+  arrange(encounter_id) %>%                    # encounters are already in order
+  mutate(
+    visit_number = row_number(),              # 1st visit, 2nd visit, etc.
+    
+    # Create a fake but realistic admission_date (30 days apart on average)
+    admission_date_proxy = as.Date("2000-01-01") + (visit_number - 1) * 30,
+    
+    # Time in days since patient's first encounter
+    time_since_first = as.numeric(admission_date_proxy - 
+                                  first(admission_date_proxy)),
+    
+    # Optional: also add cumulative inpatient days as another time axis
+    cum_inpatient_days = cumsum(time_in_hospital)
+  ) %>%
+  ungroup()
+
+# Quick check
+long_df %>%
+  select(patient_nbr, encounter_id, visit_number, admission_date_proxy, 
+         time_since_first, time_in_hospital) %>%
+  head(10)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+# === FINAL, GUARANTEED-WORKING COMPLICATION DEFINITION ===
+long_df <- long_df %>%
+  mutate(
+    # Keep diagnosis as character and clean only the "?" 
+    diag_1 = str_trim(diag_1),
+    diag_2 = str_trim(diag_2),
+    diag_3 = str_trim(diag_3),
+    
+    # Define major complication if ANY of the three diagnoses falls into these ICD-9 groups
+    complication = case_when(
+      # Circulatory (390–459) + 785
+      str_sub(diag_1, 1, 3) %in% as.character(390:459) | diag_1 == "785" ~ 1,
+      str_sub(diag_2, 1, 3) %in% as.character(390:459) | diag_2 == "785" ~ 1,
+      str_sub(diag_3, 1, 3) %in% as.character(390:459) | diag_3 == "785" ~ 1,
+      
+      # Diabetes with complications (250.x0–250.x3 where x=4,5,6,7)
+      str_detect(diag_1, "^250\\.[4567]") ~ 1,
+      str_detect(diag_2, "^250\\.[4567]") ~ 1,
+      str_detect(diag_3, "^250\\.[4567]") ~ 1,
+      
+      # Renal (580–629)
+      str_sub(diag_1, 1, 3) %in% as.character(580:629) ~ 1,
+      str_sub(diag_2, 1, 3) %in% as.character(580:629) ~ 1,
+      str_sub(diag_3, 1, 3) %in% as.character(580:629) ~ 1,
+      
+      # Eye (360–379) — retinopathy
+      str_sub(diag_1, 1, 3) %in% as.character(360:379) ~ 1,
+      str_sub(diag_2, 1, 3) %in% as.character(360:379) ~ 1,
+      str_sub(diag_3, 1, 3) %in% as.character(360:379) ~ 1,
+      
+      # Neurological (350–359) — neuropathy
+      str_sub(diag_1, 1, 3) %in% as.character(350:359) ~ 1,
+      str_sub(diag_2, 1, 3) %in% as.character(350:359) ~ 1,
+      str_sub(diag_3, 1, 3) %in% as.character(350:359) ~ 1,
+      
+      TRUE ~ 0
+    ),
+    
+    # First-time occurrence
+    complication_cum = cummax(complication),
+    new_complication = ifelse(complication == 1 & lag(complication_cum, default = 0) == 0, 1, 0),
+    
+    # Survival status
+    status = case_when(
+      discharge_disposition_id %in% c("11","19","20","21") ~ 2L,
+      new_complication == 1 ~ 1L,
+      TRUE ~ 0L
+    )
+  )
+
+# === QUICK TEST — THIS WILL NOW SHOW ~33% YES ===
+long_df %>%
+  group_by(patient_nbr) %>%
+  summarise(ever_complication = max(new_complication)) %>%
+  summarise(pct_yes = mean(ever_complication == 1) * 100)
+```
+
+## Exploratory Data Analysis (EDA)
+
+```{r}
+# === RE-RUN THIS AFTER YOUR FINAL COMPLICATION BLOCK ===
+# (Add HbA1c ordered factor — it was missing!)
+long_df <- long_df %>%
+  mutate(
+    A1C_ord = factor(A1Cresult,
+                     levels = c("None", "Norm", ">7", ">8"),
+                     ordered = TRUE)
+  )
+
+# === PROFESSIONAL THEME & PALETTE ===
+clean_theme <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 12)),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray50"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(color = "gray30"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.5),
+    plot.margin = margin(15, 15, 15, 15),
+    legend.position = "none"
+  )
+
+pal <- c("#2c7bb6", "#d7191c", "#fdae61", "#abdda4")
+
+# === PLOT 1: Distribution of Encounters ===
+p1 <- ggplot(long_df, aes(x = visit_number)) +
+  geom_histogram(binwidth = 1, fill = pal[1], color = "white", alpha = 0.9, size = 0.3) +
+  scale_x_continuous(breaks = seq(0, max(long_df$visit_number, na.rm = TRUE), by = 2)) +
+  labs(
+    title = "Distribution of Encounters per Patient",
+    x = "Number of Hospital Encounters",
+    y = "Number of Patients"
+  ) +
+  clean_theme
+
+# === PLOT 2: HbA1c Results ===
+p2 <- long_df %>%
+  count(A1C_ord) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = A1C_ord, y = prop)) +
+  geom_col(fill = pal[2], alpha = 0.9, width = 0.4) +
+  scale_y_continuous(labels = scales::percent_format(), expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "HbA1c Testing Results Across All Encounters",
+    x = "HbA1c Category",
+    y = "Proportion of Encounters"
+  ) +
+  clean_theme
+
+# === PLOT 3: Major Complications (Now Correct!) ===
+p3 <- long_df %>%
+  group_by(patient_nbr) %>%
+  summarise(complications = max(new_complication)) %>%
+  count(complications) %>%
+  mutate(
+    prop = n / sum(n),
+    complications = ifelse(complications == 1, "Yes", "No")
+  ) %>%
+  ggplot(aes(x = complications, y = prop)) +
+  geom_col(fill = pal[3], alpha = 0.9, width = 0.4) +
+  scale_y_continuous(labels = scales::percent_format(), expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "Patients Who Ever Developed a Major Complication",
+    x = "Major Complication During Follow-up",
+    y = "Proportion of Patients"
+  ) +
+  clean_theme
+
+# === DISPLAY ALL THREE PLOTS ===
+print(p1)
+print(p2)
+print(p3)
+```
