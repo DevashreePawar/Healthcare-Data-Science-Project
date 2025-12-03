@@ -27,6 +27,7 @@ library(ggplot2)
 library(dplyr)
 library(scales)
 library(patchwork)
+library(janitor)
 theme_set(theme_minimal(base_size = 12))
 set.seed(42)
 ```
@@ -51,195 +52,178 @@ All patient identifiers were removed prior to release, ensuring HIPAA compliance
 
 ```{r}
 # Load dataset
-diabetic <- read_csv("dataset_diabetes/diabetic_data.csv")
-ids     <- read_csv("dataset_diabetes/IDs_mapping.csv")
+diab <- read_csv("dataset_diabetes/diabetic_data.csv") %>% clean_names()
+id_map <- read_csv("dataset_diabetes/IDs_mapping.csv") %>% clean_names()
+
 
 # Structure of dataset
-str(diabetic)
-str(ids)
+glimpse(diab)
+summary(diab)
+
+glimpse(id_map)
+summary(id_map)
 ```
 
 ## Data cleaning
 
 ```{r}
-# Check column names
-colnames(df)
+## ============================
+## DATA CLEANING PIPELINE (FIXED)
+## ============================
 
-# Basic cleaning
-df <- diabetic %>%
-  mutate(across(c(race, payer_code, medical_specialty, diag_1, diag_2, diag_3), 
-                ~na_if(., "?")),
-         weight = na_if(weight, "?"),
-         patient_nbr = as.factor(patient_nbr),
-         age = factor(age, ordered = TRUE),
-         admission_type_id = as.factor(admission_type_id),
-         discharge_disposition_id = as.factor(discharge_disposition_id),
-         admission_source_id = as.factor(admission_source_id))
+library(dplyr)
+library(janitor)
+library(forcats)
 
-# First identify patients with ≥2 encounters
-multi_visit_patients <- df %>%
-  count(patient_nbr) %>%
-  filter(n >= 2) %>%
-  pull(patient_nbr)
+# 1. Clean column names
+diab <- diab %>% clean_names()
+id_map <- id_map %>% clean_names()
 
-# Create longitudinal dataset with proper visit_number and time proxy
-long_df <- df %>%
-  filter(patient_nbr %in% multi_visit_patients) %>%
-  group_by(patient_nbr) %>%
-  arrange(encounter_id) %>%                    # encounters are already in order
-  mutate(
-    visit_number = row_number(),              # 1st visit, 2nd visit, etc.
-    
-    # Create a fake but realistic admission_date (30 days apart on average)
-    admission_date_proxy = as.Date("2000-01-01") + (visit_number - 1) * 30,
-    
-    # Time in days since patient's first encounter
-    time_since_first = as.numeric(admission_date_proxy - 
-                                  first(admission_date_proxy)),
-    
-    # Optional: also add cumulative inpatient days as another time axis
-    cum_inpatient_days = cumsum(time_in_hospital)
-  ) %>%
-  ungroup()
+# 2. Replace "?" with NA *only for character columns*
+diab <- diab %>%
+  mutate(across(where(is.character), ~na_if(., "?")))
 
-# Quick check
-long_df %>%
-  select(patient_nbr, encounter_id, visit_number, admission_date_proxy, 
-         time_since_first, time_in_hospital) %>%
-  head(10)
-```
+# 3. Convert character columns to factors
+diab <- diab %>%
+  mutate(across(where(is.character), as.factor))
 
-```{r}
-# === FINAL, GUARANTEED-WORKING COMPLICATION DEFINITION ===
-long_df <- long_df %>%
-  mutate(
-    # Keep diagnosis as character and clean only the "?" 
-    diag_1 = str_trim(diag_1),
-    diag_2 = str_trim(diag_2),
-    diag_3 = str_trim(diag_3),
-    
-    # Define major complication if ANY of the three diagnoses falls into these ICD-9 groups
-    complication = case_when(
-      # Circulatory (390–459) + 785
-      str_sub(diag_1, 1, 3) %in% as.character(390:459) | diag_1 == "785" ~ 1,
-      str_sub(diag_2, 1, 3) %in% as.character(390:459) | diag_2 == "785" ~ 1,
-      str_sub(diag_3, 1, 3) %in% as.character(390:459) | diag_3 == "785" ~ 1,
-      
-      # Diabetes with complications (250.x0–250.x3 where x=4,5,6,7)
-      str_detect(diag_1, "^250\\.[4567]") ~ 1,
-      str_detect(diag_2, "^250\\.[4567]") ~ 1,
-      str_detect(diag_3, "^250\\.[4567]") ~ 1,
-      
-      # Renal (580–629)
-      str_sub(diag_1, 1, 3) %in% as.character(580:629) ~ 1,
-      str_sub(diag_2, 1, 3) %in% as.character(580:629) ~ 1,
-      str_sub(diag_3, 1, 3) %in% as.character(580:629) ~ 1,
-      
-      # Eye (360–379) — retinopathy
-      str_sub(diag_1, 1, 3) %in% as.character(360:379) ~ 1,
-      str_sub(diag_2, 1, 3) %in% as.character(360:379) ~ 1,
-      str_sub(diag_3, 1, 3) %in% as.character(360:379) ~ 1,
-      
-      # Neurological (350–359) — neuropathy
-      str_sub(diag_1, 1, 3) %in% as.character(350:359) ~ 1,
-      str_sub(diag_2, 1, 3) %in% as.character(350:359) ~ 1,
-      str_sub(diag_3, 1, 3) %in% as.character(350:359) ~ 1,
-      
-      TRUE ~ 0
-    ),
-    
-    # First-time occurrence
-    complication_cum = cummax(complication),
-    new_complication = ifelse(complication == 1 & lag(complication_cum, default = 0) == 0, 1, 0),
-    
-    # Survival status
-    status = case_when(
-      discharge_disposition_id %in% c("11","19","20","21") ~ 2L,
-      new_complication == 1 ~ 1L,
-      TRUE ~ 0L
-    )
-  )
+# 4. Convert id_map IDs to numeric if needed
+id_map <- id_map %>%
+  mutate(across(where(is.character), as.numeric))
 
-# === QUICK TEST — THIS WILL NOW SHOW ~33% YES ===
-long_df %>%
-  group_by(patient_nbr) %>%
-  summarise(ever_complication = max(new_complication)) %>%
-  summarise(pct_yes = mean(ever_complication == 1) * 100)
+# 5. Join readable admission type descriptions
+id_map_clean <- id_map %>%
+  rename(admission_type_desc = description)
+
+diab <- diab %>%
+  left_join(id_map_clean, by = "admission_type_id")
+
+# 6. Lump rare medical specialties
+diab <- diab %>%
+  mutate(medical_specialty = fct_lump(medical_specialty, n = 10))
+
+# 7. Convert age bracket to numeric midpoint
+diab <- diab %>%
+  mutate(age_num = case_when(
+    age == "[0-10)" ~ 5,
+    age == "[10-20)" ~ 15,
+    age == "[20-30)" ~ 25,
+    age == "[30-40)" ~ 35,
+    age == "[40-50)" ~ 45,
+    age == "[50-60)" ~ 55,
+    age == "[60-70)" ~ 65,
+    age == "[70-80)" ~ 75,
+    age == "[80-90)" ~ 85,
+    age == "[90-100)" ~ 95,
+    TRUE ~ NA_real_
+  ))
+
+# 8. Create binary readmission outcome
+diab <- diab %>%
+  mutate(readmitted_binary = case_when(
+    readmitted == "<30" ~ 1,
+    TRUE ~ 0
+  ))
+
+cleaned_diab <- diab
+
+print(cleaned_diab)
 ```
 
 ## Exploratory Data Analysis (EDA)
 
 ```{r}
-# === RE-RUN THIS AFTER YOUR FINAL COMPLICATION BLOCK ===
-# (Add HbA1c ordered factor — it was missing!)
-long_df <- long_df %>%
-  mutate(
-    A1C_ord = factor(A1Cresult,
-                     levels = c("None", "Norm", ">7", ">8"),
-                     ordered = TRUE)
-  )
+library(RColorBrewer)
 
-# === PROFESSIONAL THEME & PALETTE ===
-clean_theme <- theme_minimal(base_size = 13) +
+# Consistent clean theme
+clean_theme <- theme_light(base_size = 14) +
   theme(
-    plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 12)),
-    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray50"),
-    axis.title = element_text(size = 12),
-    axis.text = element_text(color = "gray30"),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
     panel.grid.minor = element_blank(),
-    panel.grid.major = element_line(color = "gray90", linewidth = 0.5),
-    plot.margin = margin(15, 15, 15, 15),
-    legend.position = "none"
+    panel.border = element_rect(color = "gray80", fill = NA)
   )
 
-pal <- c("#2c7bb6", "#d7191c", "#fdae61", "#abdda4")
+theme_set(clean_theme)
+```
 
-# === PLOT 1: Distribution of Encounters ===
-p1 <- ggplot(long_df, aes(x = visit_number)) +
-  geom_histogram(binwidth = 1, fill = pal[1], color = "white", alpha = 0.9, size = 0.3) +
-  scale_x_continuous(breaks = seq(0, max(long_df$visit_number, na.rm = TRUE), by = 2)) +
+```{r}
+# -------------------------------
+# 1. Missing Value Summary
+# -------------------------------
+missing_summary <- cleaned_diab %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "missing") %>%
+  filter(missing > 0)
+
+ggplot(missing_summary, aes(x = reorder(variable, -missing), y = missing)) +
+  geom_col(fill = "#6395F9") +
+  coord_flip() +
+  scale_y_continuous(labels = comma_format()) +
   labs(
-    title = "Distribution of Encounters per Patient",
-    x = "Number of Hospital Encounters",
-    y = "Number of Patients"
+    title = "Missing Values by Variable",
+    x = "Variable",
+    y = "Count of Missing Values"
   ) +
-  clean_theme
+  theme_minimal(base_size = 13)
 
-# === PLOT 2: HbA1c Results ===
-p2 <- long_df %>%
-  count(A1C_ord) %>%
-  mutate(prop = n / sum(n)) %>%
-  ggplot(aes(x = A1C_ord, y = prop)) +
-  geom_col(fill = pal[2], alpha = 0.9, width = 0.4) +
-  scale_y_continuous(labels = scales::percent_format(), expand = expansion(mult = c(0, 0.05))) +
-  labs(
-    title = "HbA1c Testing Results Across All Encounters",
-    x = "HbA1c Category",
-    y = "Proportion of Encounters"
-  ) +
-  clean_theme
+# -------------------------------
+# 2. Age Distribution
+# -------------------------------
+age_order <- c("[0-10)", "[10-20)", "[20-30)", "[30-40)", "[40-50)", 
+               "[50-60)", "[60-70)", "[70-80)", "[80-90)", "[90-100)")
 
-# === PLOT 3: Major Complications (Now Correct!) ===
-p3 <- long_df %>%
-  group_by(patient_nbr) %>%
-  summarise(complications = max(new_complication)) %>%
-  count(complications) %>%
-  mutate(
-    prop = n / sum(n),
-    complications = ifelse(complications == 1, "Yes", "No")
-  ) %>%
-  ggplot(aes(x = complications, y = prop)) +
-  geom_col(fill = pal[3], alpha = 0.9, width = 0.4) +
-  scale_y_continuous(labels = scales::percent_format(), expand = expansion(mult = c(0, 0.05))) +
-  labs(
-    title = "Patients Who Ever Developed a Major Complication",
-    x = "Major Complication During Follow-up",
-    y = "Proportion of Patients"
-  ) +
-  clean_theme
+ggplot(cleaned_diab, aes(x = factor(age, levels = age_order))) +
+  geom_bar(fill = brewer.pal(8, "Oranges")[5], color = "black", linewidth = 0.3) +
+  labs(title = "Age Bracket Distribution",
+       x = "Age Bracket",
+       y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-# === DISPLAY ALL THREE PLOTS ===
-print(p1)
-print(p2)
-print(p3)
+# -------------------------------
+# 3. Readmission Patterns
+# -------------------------------
+## Raw readmission
+ggplot(cleaned_diab, aes(x = fct_infreq(readmitted))) +
+  geom_bar(fill = brewer.pal(8, "Blues")[5], color = "black", linewidth = 0.3) +
+  labs(title = "Raw Distribution of Readmission Outcomes",
+       x = "Readmission Category",
+       y = "Count")
+
+## Binary readmission
+ggplot(cleaned_diab, aes(x = as.factor(readmitted_binary))) +
+  geom_bar(fill = brewer.pal(8, "RdPu")[7], color = "black", linewidth = 0.3) +
+  labs(title = "Binary Readmission (<30 Days) Distribution",
+       x = "Readmitted <30 Days (1 = Yes)",
+       y = "Count") +
+  scale_x_discrete(labels = c("0" = "No", "1" = "Yes"))
+
+# -------------------------------
+# 4. Clinical Features
+# -------------------------------
+## Time in hospital
+ggplot(cleaned_diab, aes(x = time_in_hospital)) +
+  geom_histogram(binwidth = 1, fill = brewer.pal(8, "Oranges")[6], color = "black", linewidth = 0.3) +
+  labs(title = "Distribution of Time in Hospital",
+       x = "Days",
+       y = "Frequency")
+
+## Number of medications
+ggplot(cleaned_diab, aes(x = num_medications)) +
+  geom_histogram(binwidth = 2, fill = brewer.pal(8, "Greens")[6], color = "black", linewidth = 0.3) +
+  labs(title = "Number of Medications per Encounter",
+       x = "Medication Count",
+       y = "Frequency")
+
+## Number of lab procedures
+ggplot(cleaned_diab %>% filter(!is.na(num_lab_procedures)), aes(x = num_lab_procedures)) +
+  geom_histogram(binwidth = 5, fill = brewer.pal(8, "Purples")[6], color = "black", linewidth = 0.3) +
+  labs(title = "Number of Lab Procedures",
+       x = "Count",
+       y = "Frequency")
+
 ```
