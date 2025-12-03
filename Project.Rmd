@@ -414,13 +414,13 @@ ggplot(plot_df, aes(x = time, y = est, color = event)) +
   )
 ```
 
-## RQ3: Dynamic Prediction of Next Major Complication – Model Comparison
+## RQ3: Dynamic Prediction of Next Major Complication – Model Comparison (Final Working Version)
 
-We train three models to predict whether a patient will experience their **first major diabetic complication at the next hospital encounter**, using only information available up to the current visit.
+**Goal**: Predict first major diabetic complication at the **next** hospital encounter using current + past data.
 
-**Models compared**: 1. Logistic Regression (baseline) 2. Random Forest 3. XGBoost (best expected performance)
+**Models**: 1. Logistic Regression 2. Random Forest 3. XGBoost
 
-**Target**: `first_complication == 1\` at the **next** visit **Temporal split**: train on earlier visits (1st–80th percentile), test on later visits
+**Metrics**: ROC-AUC, PR-AUC, Brier Score on temporal test set
 
 ```{r}
 library(tidymodels)
@@ -430,7 +430,7 @@ library(pROC)
 library(DALEXtra)
 tidymodels_prefer()
 
-# --- Clean target creation ---
+# --- Create prediction dataset ---
 pred_data <- long_df %>%
   mutate(
     first_complication = as.integer(first_complication),
@@ -455,50 +455,57 @@ split_val <- quantile(pred_data$visit_number, 0.8)
 train_data <- pred_data %>% filter(visit_number <= split_val)
 test_data  <- pred_data %>% filter(visit_number > split_val)
 
-cat("Train:", nrow(train_data), "| Test:", nrow(test_data), 
-    "| Event rate:", scales::percent(mean(test_data$target == "1")), "\n")
+cat("Training rows:", nrow(train_data), "\n")
+cat("Test rows:", nrow(test_data), "\n")
+cat("Event rate in test set:", scales::percent(mean(test_data$target == "1")), "\n")
 
 # --- Recipe ---
 rec <- recipe(target ~ ., data = train_data) %>%
   step_dummy(all_nominal_predictors()) %>%
   step_normalize(all_numeric_predictors())
 
-# --- Workflows ---
-wf_log  <- workflow() %>% add_recipe(rec) %>% add_model(logistic_reg() %>% set_engine("glm"))
-wf_rf   <- workflow() %>% add_recipe(rec) %>% add_model(rand_forest(trees = 500) %>% set_engine("ranger"))
-wf_xgb  <- workflow() %>% add_recipe(rec) %>% add_model(boost_tree(trees = 400, learn_rate = 0.05) %>% set_engine("xgboost"))
+# --- Workflows with explicit mode ---
+wf_log <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(logistic_reg() %>% set_engine("glm") %>% set_mode("classification"))
 
-# --- Fit ---
+wf_rf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rand_forest(trees = 500) %>% set_engine("ranger") %>% set_mode("classification"))
+
+wf_xgb <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(boost_tree(trees = 400, learn_rate = 0.05) %>% set_engine("xgboost") %>% set_mode("classification"))
+
+# --- Fit models ---
 fit_log <- fit(wf_log, train_data)
 fit_rf  <- fit(wf_rf,  train_data)
 fit_xgb <- fit(wf_xgb, train_data)
 
 # --- Predictions ---
-p_log  <- predict(fit_log, test_data, type = "prob")$.pred_1
-p_rf   <- predict(fit_rf,  test_data, type = "prob")$.pred_1
-p_xgb  <- predict(fit_xgb, test_data, type = "prob")$.pred_1
+p_log  <- predict(fit_log,  test_data, type = "prob")$.pred_1
+p_rf   <- predict(fit_rf,   test_data, type = "prob")$.pred_1
+p_xgb  <- predict(fit_xgb,  test_data, type = "prob")$.pred_1
 
-truth <- test_data$target %>% as.numeric() - 1
+truth_factor <- test_data$target  # Factor with two levels
+truth_num <- as.numeric(truth_factor) - 1  # Numeric 0/1
 
-# --- Manual metrics (100% safe) ---
-metrics <- tibble(
-  Model = c("Logistic Regression", "Random Forest", "XGBoost"),
-  ROC_AUC = c(
-    auc(roc(truth, p_log)),
-    auc(roc(truth, p_rf)),
-    auc(roc(truth, p_xgb))
-  ),
-  PR_AUC = c(
-    yardstick::pr_auc_vec(truth, p_log),
-    yardstick::pr_auc_vec(truth, p_rf),
-    yardstick::pr_auc_vec(truth, p_xgb)
-  ),
-  Brier = c(
-    mean((p_log - truth)^2),
-    mean((p_rf  - truth)^2),
-    mean((p_xgb - truth)^2)
+# --- Manual metrics (with factor for ROC) ---
+calc_metrics <- function(prob, truth_f, truth_n) {
+  c(
+    ROC_AUC = as.numeric(auc(roc(truth_f, prob))),
+    PR_AUC  = as.numeric(pr_auc_vec(truth_n, prob)),
+    Brier   = mean((prob - truth_n)^2)
   )
-) %>% arrange(desc(ROC_AUC))
+}
 
-knitr::kable(metrics, digits = 4, caption = "Final Model Performance (Temporal Test Set)")
+results <- bind_rows(
+  calc_metrics(p_log, truth_factor, truth_num) %>% t() %>% as.data.frame() %>% mutate(Model = "Logistic Regression"),
+  calc_metrics(p_rf, truth_factor, truth_num) %>% t() %>% as.data.frame() %>% mutate(Model = "Random Forest"),
+  calc_metrics(p_xgb, truth_factor, truth_num) %>% t() %>% as.data.frame() %>% mutate(Model = "XGBoost")
+) %>%
+  select(Model, ROC_AUC, PR_AUC, Brier) %>%
+  arrange(desc(ROC_AUC))
+
+knitr::kable(results, digits = 4, caption = "Final Model Performance Comparison")
 ```
