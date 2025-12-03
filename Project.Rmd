@@ -322,3 +322,183 @@ ggplot(pred_data, aes(x = visit_number, y = predicted)) +
     plot.caption = element_text(size = 9, color = "gray60")
   )
 ```
+
+## RQ2: Cumulative Incidence of First Major Diabetic Complication (Competing Risks)
+
+We define **major diabetic complications** using primary/secondary/tertiary ICD-9 codes: - Nephropathy (250.4x, 585.x) - Retinopathy (250.5x, 362.0x) - Neuropathy (250.6x, 357.2) - Cardiovascular events (390–429, 785)
+
+**Competing event**: In-hospital mortality (`discharge_disposition_id == 11`, i.e., "Expired").
+
+We analyze **time-to-first complication** with death as a competing risk using the Aalen-Johansen estimator.
+
+```{r}
+library(cmprsk)
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# --- Define events cleanly ---
+long_df <- long_df %>%
+  mutate(
+    complication_this_visit = ifelse(
+      str_detect(as.character(diag_1), "^250\\.4|^250\\.5|^250\\.6|^585|^362|^357\\.2|^39[0-8]|^4[0-2][0-9]|^785") |
+      str_detect(as.character(diag_2), "^250\\.4|^250\\.5|^250\\.6|^585|^362|^357\\.2|^39[0-8]|^4[0-2][0-9]|^785") |
+      str_detect(as.character(diag_3), "^250\\.4|^250\\.5|^250\\.6|^585|^362|^357\\.2|^39[0-8]|^4[0-2][0-9]|^785"),
+      1, 0
+    ),
+    
+    # First complication only
+    first_complication = complication_this_visit == 1 & 
+                         cummax(complication_this_visit) == 1 &
+                         lag(cummax(complication_this_visit), default = 0) == 0,
+    
+    death = ifelse(discharge_disposition_id == 11, 1, 0),
+    status = case_when(
+      first_complication ~ 1,
+      death == 1         ~ 2,
+      TRUE               ~ 0
+    ),
+    time = visit_number
+  )
+
+# --- One row per patient (last observed visit) ---
+cr_data <- long_df %>%
+  group_by(patient_nbr) %>%
+  arrange(time) %>%
+  slice_tail(n = 1) %>%
+  ungroup()
+
+cat("Patients analyzed:", nrow(cr_data), "\n")
+cat("First complications:", sum(cr_data$status == 1), "\n")
+cat("Deaths without complication:", sum(cr_data$status == 2), "\n")
+
+# --- Run cuminc safely ---
+fit <- cuminc(ftime = cr_data$time, fstatus = cr_data$status)
+
+# --- Build plot data frame safely (handles missing death curve) ---
+time_points <- sort(unique(cr_data$time))
+
+# Complication curve (always exists)
+comp_curve <- fit$"1"
+comp_df <- data.frame(time = comp_curve$time, est = comp_curve$est, event = "First Complication")
+
+# Death curve – only if any deaths occurred
+if ("2" %in% names(fit)) {
+  death_curve <- fit$"2"
+  death_df <- data.frame(time = death_curve$time, est = death_curve$est, event = "Death")
+  plot_df <- rbind(comp_df, death_df)
+} else {
+  # No deaths → just show complication curve
+  plot_df <- comp_df
+  message("No in-hospital deaths recorded → only complication curve shown")
+}
+
+# --- Final beautiful plot ---
+ggplot(plot_df, aes(x = time, y = est, color = event)) +
+  geom_step(size = 1.8) +
+  scale_color_manual(values = c("First Complication" = "#E63946", "Death" = "#457B9D")) +
+  labs(
+    title = "Cumulative Incidence of First Major Diabetic Complication",
+    subtitle = "Competing risks analysis (Aalen–Johansen estimator) | n = 71,518 patients with ≥2 encounters",
+    x = "Hospital Encounter Number",
+    y = "Cumulative Incidence",
+    color = "Event",
+    caption = "Red = Nephropathy, retinopathy, neuropathy, or cardiovascular event | Blue = In-hospital mortality (if present)"
+  ) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 0.5)) +
+  scale_x_continuous(breaks = seq(1, 100, 5)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+```
+
+## RQ3: Dynamic Prediction of Next Major Complication – Model Comparison
+
+We train three models to predict whether a patient will experience their **first major diabetic complication at the next hospital encounter**, using only information available up to the current visit.
+
+**Models compared**: 1. Logistic Regression (baseline) 2. Random Forest 3. XGBoost (best expected performance)
+
+**Target**: `first_complication == 1\` at the **next** visit **Temporal split**: train on earlier visits (1st–80th percentile), test on later visits
+
+```{r}
+library(tidymodels)
+library(dplyr)
+library(yardstick)
+library(pROC)
+library(DALEXtra)
+tidymodels_prefer()
+
+# --- Clean target creation ---
+pred_data <- long_df %>%
+  mutate(
+    first_complication = as.integer(first_complication),
+    patient_nbr = as.character(patient_nbr)
+  ) %>%
+  group_by(patient_nbr) %>%
+  arrange(visit_number) %>%
+  mutate(target = lead(first_complication, default = 0L)) %>%
+  ungroup() %>%
+  filter(!is.na(target)) %>%
+  mutate(
+    target = factor(target, levels = c("0", "1")),
+    gender = factor(gender),
+    race = factor(race),
+    insulin = factor(insulin)
+  ) %>%
+  select(target, visit_number, age_num, gender, race, insulin,
+         num_medications, time_in_hospital, number_diagnoses, num_lab_procedures)
+
+# Temporal split
+split_val <- quantile(pred_data$visit_number, 0.8)
+train_data <- pred_data %>% filter(visit_number <= split_val)
+test_data  <- pred_data %>% filter(visit_number > split_val)
+
+cat("Train:", nrow(train_data), "| Test:", nrow(test_data), 
+    "| Event rate:", scales::percent(mean(test_data$target == "1")), "\n")
+
+# --- Recipe ---
+rec <- recipe(target ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# --- Workflows ---
+wf_log  <- workflow() %>% add_recipe(rec) %>% add_model(logistic_reg() %>% set_engine("glm"))
+wf_rf   <- workflow() %>% add_recipe(rec) %>% add_model(rand_forest(trees = 500) %>% set_engine("ranger"))
+wf_xgb  <- workflow() %>% add_recipe(rec) %>% add_model(boost_tree(trees = 400, learn_rate = 0.05) %>% set_engine("xgboost"))
+
+# --- Fit ---
+fit_log <- fit(wf_log, train_data)
+fit_rf  <- fit(wf_rf,  train_data)
+fit_xgb <- fit(wf_xgb, train_data)
+
+# --- Predictions ---
+p_log  <- predict(fit_log, test_data, type = "prob")$.pred_1
+p_rf   <- predict(fit_rf,  test_data, type = "prob")$.pred_1
+p_xgb  <- predict(fit_xgb, test_data, type = "prob")$.pred_1
+
+truth <- test_data$target %>% as.numeric() - 1
+
+# --- Manual metrics (100% safe) ---
+metrics <- tibble(
+  Model = c("Logistic Regression", "Random Forest", "XGBoost"),
+  ROC_AUC = c(
+    auc(roc(truth, p_log)),
+    auc(roc(truth, p_rf)),
+    auc(roc(truth, p_xgb))
+  ),
+  PR_AUC = c(
+    yardstick::pr_auc_vec(truth, p_log),
+    yardstick::pr_auc_vec(truth, p_rf),
+    yardstick::pr_auc_vec(truth, p_xgb)
+  ),
+  Brier = c(
+    mean((p_log - truth)^2),
+    mean((p_rf  - truth)^2),
+    mean((p_xgb - truth)^2)
+  )
+) %>% arrange(desc(ROC_AUC))
+
+knitr::kable(metrics, digits = 4, caption = "Final Model Performance (Temporal Test Set)")
+```
