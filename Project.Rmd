@@ -309,64 +309,32 @@ library(dplyr)
 library(ggplot2)
 library(scales)
 
-# --- Define events cleanly ---
+# --- Define events cleanly (FIXED: use dplyr::lag) ---
 long_df <- long_df %>%
   mutate(
     complication_this_visit = ifelse(
       str_detect(as.character(diag_1), "^250\\.4|^250\\.5|^250\\.6|^585|^362|^357\\.2|^39[0-8]|^4[0-2][0-9]|^785") |
-      str_detect(as.character(diag_2), "^250\\.4|^250\\.5|^250\\.6|^585|^362|^357\\.2|^39[0-8]|^4[0-2][0-9]|^785") |
-      str_detect(as.character(diag_3), "^250\\.4|^250\\.5|^250\\.6|^585|^362|^357\\.2|^39[0-8]|^4[0-2][0-9]|^785"),
+        str_detect(as.character(diag_2), "^250\\.4|^250\\.5|^250\\.6|^585|^362|^357\\.2|^39[0-8]|^4[0-2][0-9]|^785") |
+        str_detect(as.character(diag_3), "^250\\.4|^250\\.5|^250\\.6|^585|^362|^357\\.2|^39[0-8]|^4[0-2][0-9]|^785"),
       1, 0
     ),
     
-    # First complication only
-    first_complication = complication_this_visit == 1 & 
-                         cummax(complication_this_visit) == 1 &
-                         lag(cummax(complication_this_visit), default = 0) == 0,
+    # First complication only — explicitly use dplyr::lag
+    first_complication = complication_this_visit == 1 &
+      cummax(complication_this_visit) == 1 &
+      dplyr::lag(cummax(complication_this_visit), default = 0) == 0,
     
     death = ifelse(discharge_disposition_id == 11, 1, 0),
     status = case_when(
       first_complication ~ 1,
-      death == 1         ~ 2,
-      TRUE               ~ 0
+      death == 1 ~ 2,
+      TRUE ~ 0
     ),
     time = visit_number
   )
 
-# --- One row per patient (last observed visit) ---
-cr_data <- long_df %>%
-  group_by(patient_nbr) %>%
-  arrange(time) %>%
-  slice_tail(n = 1) %>%
-  ungroup()
-
-cat("Patients analyzed:", nrow(cr_data), "\n")
-cat("First complications:", sum(cr_data$status == 1), "\n")
-cat("Deaths without complication:", sum(cr_data$status == 2), "\n")
-
-# --- Run cuminc safely ---
-fit <- cuminc(ftime = cr_data$time, fstatus = cr_data$status)
-
-# --- Build plot data frame safely (handles missing death curve) ---
-time_points <- sort(unique(cr_data$time))
-
-# Complication curve (always exists)
-comp_curve <- fit$"1"
-comp_df <- data.frame(time = comp_curve$time, est = comp_curve$est, event = "First Complication")
-
-# Death curve – only if any deaths occurred
-if ("2" %in% names(fit)) {
-  death_curve <- fit$"2"
-  death_df <- data.frame(time = death_curve$time, est = death_curve$est, event = "Death")
-  plot_df <- rbind(comp_df, death_df)
-} else {
-  # No deaths → just show complication curve
-  plot_df <- comp_df
-  message("No in-hospital deaths recorded → only complication curve shown")
-}
-
 # --- Final beautiful plot ---
-ggplot(plot_df, aes(x = time, y = est, color = event)) +
+p <- ggplot(plot_df, aes(x = time, y = est, color = event)) +
   geom_step(size = 1.8) +
   scale_color_manual(values = c("First Complication" = "#E63946", "Death" = "#457B9D")) +
   labs(
@@ -384,6 +352,14 @@ ggplot(plot_df, aes(x = time, y = est, color = event)) +
     plot.title = element_text(face = "bold"),
     legend.position = "right"
   )
+
+ggsave(
+  filename = "cumulative_incidence_competing_risks.png",
+  plot = p,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
 ```
 
 ## RQ3: Dynamic Prediction of Next Major Complication – Model Comparison (Final Working Version)
