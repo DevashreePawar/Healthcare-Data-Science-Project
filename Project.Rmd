@@ -582,3 +582,52 @@ knitr::kable(results,
   align = "lccc"
 )
 ```
+
+### SHAP
+
+```{r rq3-shap-fixed, fig.width=11, fig.height=7}
+# ── FIXED SHAP EXPLANATION FOR XGBoost (no more "new_observation" error) ──
+library(DALEXtra)
+library(tidymodels)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+# Step 1: Fit final model on full data (uses your existing workflow)
+final_xgb <- wf %>% 
+  add_model(xgb_model_fast) %>% 
+  fit(pred_df)
+
+# Step 2: Create explainer
+explainer_xgb <- explain_tidymodels(
+  final_xgb,
+  data = pred_df %>% select(-target),
+  y = as.numeric(pred_df$target) - 1,  # 0/1 for XGBoost
+  label = "XGBoost – Best Model"
+)
+
+# Step 3: Global SHAP importance (no new_observation needed)
+shap_importance <- model_parts(explainer_xgb, type = "variable_importance", B = 25)
+
+# Step 4: Individual SHAP summary (FIX: add new_observation = first 50 rows)
+shap_summary <- predict_parts(
+  explainer_xgb, 
+  type = "shap", 
+  new_observation = pred_df[1:50, ],  # Sample 50 patients for summary
+  B = 25
+)
+
+# Step 5: Beautiful side-by-side plots
+p1 <- plot(shap_importance) + 
+  ggtitle("Global SHAP Feature Importance\n(Top Predictors of Readmission Risk)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p2 <- plot(shap_summary) + 
+  ggtitle("SHAP Summary Plot\n(Individual Feature Contributions for 50 Patients)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Display plots
+p1 / p2  # Stacked for better space
+```
