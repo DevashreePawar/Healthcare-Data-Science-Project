@@ -197,7 +197,8 @@ ggplot(cleaned_diab, aes(x = as.factor(readmitted_binary))) +
   labs(title = "Binary Readmission (<30 Days) Distribution",
        x = "Readmitted <30 Days (1 = Yes)",
        y = "Count") +
-  scale_x_discrete(labels = c("0" = "No", "1" = "Yes"))
+  scale_x_discrete(labels = c("0" = "No", "1" = "Yes")) +
+  scale_y_continuous(labels = ~ format(.x, big.mark = ",", scientific = FALSE))
 ```
 
 # Research Questions
