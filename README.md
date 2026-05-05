@@ -1,5 +1,7 @@
 # Disease Progression Analytics Dashboard
 
+**🚀 [View Live Dashboard](https://8etlvn-devashree-pawar.shinyapps.io/healthcare-data-science-project/)**
+
 This is an interactive dashboard I built to explore how diabetes progresses over time in patients. It's built with R Shiny and uses data from over 100,000 hospital encounters across 130 US hospitals from 1999-2008.
 
 ## Getting Started
@@ -84,3 +86,17 @@ The app loads your data from the CSV files in the `dataset_diabetes/` folder and
 All patient identifiers have been stripped out, so this is a de-identified dataset. It's a good benchmark for diabetes research.
 
 If you want to understand the details better, check out the Project.Rmd file where I documented everything as I went.
+
+# In RStudio console
+install.packages("rsconnect")
+library(rsconnect)
+
+# Authorize (get token from shinyapps.io account settings)
+rsconnect::setAccountInfo(
+  name = "YOUR_USERNAME",
+  token = "YOUR_TOKEN", 
+  secret = "YOUR_SECRET"
+)
+
+# Deploy
+rsconnect::deployApp("app.R")
