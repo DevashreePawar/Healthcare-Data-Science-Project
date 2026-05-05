@@ -1,18 +1,11 @@
 # Disease Progression Analytics Dashboard
 
-An interactive R Shiny dashboard for analyzing diabetes progression using longitudinal electronic health records from 130 U.S. hospitals (1999-2008).
+This is an interactive dashboard I built to explore how diabetes progresses over time in patients. It's built with R Shiny and uses data from over 100,000 hospital encounters across 130 US hospitals from 1999-2008.
 
----
+## Getting Started
 
-## 🚀 Quick Start
+You'll need R installed first. Then grab these packages:
 
-### Prerequisites
-- R version 4.0+
-- RStudio (optional but recommended)
-
-### Installation
-
-Install required packages:
 ```r
 install.packages(c(
   "shiny", "shinydashboard", "tidyverse", "plotly", "DT",
@@ -21,161 +14,73 @@ install.packages(c(
 ))
 ```
 
-### Run the Dashboard
+Then just run:
 
 ```bash
 cd /path/to/Healthcare-Data-Science-Project
 Rscript -e "shiny::runApp('app.R')"
 ```
 
-Or in RStudio: Open `app.R` → Click **Run App**
+The dashboard will open in your browser.
 
----
+## What's Inside
 
-## 📊 Dashboard Overview
+I split the analysis into 7 main sections:
 
-### 7 Interactive Tabs
+**Overview** - The big picture. What this project is about, dataset details, and the main research questions.
 
-| Tab | Description |
-|-----|-------------|
-| **Overview** | Project description, dataset statistics, research questions |
-| **Data Exploration** | 8 visualizations + 3D cohort explorer |
-| **RQ1: Glycemic Control** | HbA1c trajectories over time (LME model + 3D plot) |
-| **RQ2: Competing Risks** | Complication incidence accounting for mortality |
-| **RQ3: Prediction Models** | SMOTE before/after comparison (LR, RF, XGBoost) |
-| **SMOTE Analysis** | Class imbalance handling & impact on metrics |
-| **Summary Report** | Key findings & clinical recommendations |
+**Data Exploration** - Just poking around the data. Charts for readmission rates, age, HbA1c levels, medications, etc. There's also a 3D visualization where you can see how age, medications, and hospital stay length interact.
 
----
+**RQ1: Glycemic Control** - I fit a linear mixed-effects model to see how blood sugar control (HbA1c) changes across repeat hospitalizations. The main finding? It gets worse with each visit. There's also a 3D plot showing this from different angles.
 
-## 📈 Key Features
+**RQ2: Competing Risks** - This is about major complications like kidney disease, eye damage, nerve damage, and heart problems. The tricky part is that some patients die before they develop complications, so I had to use a competing risks approach to get honest numbers.
 
-✅ **3D Visualizations** - Interactive rotating plots for multi-dimensional data  
-✅ **SMOTE Comparison** - Before/After class balancing analysis  
-✅ **Color-Coded** - Professional Blues, Heat, and Magma palettes  
-✅ **Real-Time Computation** - On-demand model fitting  
-✅ **Responsive Design** - Works on desktop, tablet, mobile  
+**RQ3: Prediction Models** - Can we predict if a patient will be readmitted at their next visit? I tried three models (logistic regression, random forest, XGBoost) on both unbalanced and balanced data. The balanced data (using SMOTE) performs way better.
 
----
+**SMOTE Analysis** - Deep dive into class imbalance. Original data is like 85-15 (no readmission vs readmission). SMOTE synthetically creates more readmission cases to balance it out. Huge difference in model sensitivity.
 
-## 🎯 Research Questions
+**Summary** - What did we actually learn? What should clinicians do with this?
 
-**RQ1: Glycemic Control Trajectories**
-- How does HbA1c evolve over repeated hospitalizations?
-- Finding: Increases ~0.1-0.15% per encounter (disease progression)
+## The Data
 
-**RQ2: Competing Risks Analysis**
-- Cumulative incidence of major complications accounting for death
-- Finding: Aalen-Johansen method essential for unbiased prognosis
+It's the Diabetes 130-US Hospitals dataset from the UCI Machine Learning Repository. 101,766 encounters from 71,490 patients. Most patients (78%) come back multiple times, which is why we can do longitudinal analysis.
 
-**RQ3: Dynamic Prediction**
-- Can we predict readmission at next visit?
-- Finding: XGBoost + SMOTE achieves 87% ROC-AUC with 82% sensitivity
+Key variables include demographics, what meds they're on, lab results (especially HbA1c), ICD-9 diagnosis codes, and whether they got readmitted.
 
----
+## What I Found
 
-## 📊 Dataset
+**Glycemic Control Gets Worse Over Time**
+- HbA1c increases about 0.1-0.15% with each hospitalization
+- This suggests disease progression and probably inadequate management between visits
 
-- **Source**: Diabetes 130-US Hospitals Dataset (UCI ML Repository)
-- **Time Period**: 1999-2008
-- **Total Encounters**: 101,766
-- **Unique Patients**: 71,490
-- **Longitudinal Cohort**: 55,453 patients with ≥2 encounters (78%)
+**Competing Risks Matter**
+- About 2-5% of patients die in the hospital
+- If you just ignore this and use standard survival analysis, you overestimate complication rates
+- Using Aalen-Johansen instead gives you the real picture
 
----
+**SMOTE Dramatically Improves Prediction**
+- Before: High accuracy but misses most of the readmissions we actually care about
+- After: Lower accuracy overall, but catches 82% of readmissions vs only 43% before
+- XGBoost works best (ROC-AUC of 0.87)
 
-## 🔬 Methods
+## Technical Stuff
 
-| Research Question | Method |
-|-------------------|--------|
-| RQ1 | Linear Mixed-Effects Model (random intercepts) |
-| RQ2 | Aalen-Johansen Cumulative Incidence |
-| RQ3 | SMOTE + 3 ML Models (LR, RF, XGBoost) |
+For RQ1 I used linear mixed-effects models to account for the fact that we have multiple visits per patient. For RQ2 I implemented Aalen-Johansen cumulative incidence estimation. For RQ3 I did 5-fold cross-validation with 2 repeats and tested it on both imbalanced and SMOTE-balanced data.
 
-**Validation**: 5-fold CV with 2 repeats (10 folds), patient-level grouping
+The color schemes are a mix of Blues for the exploratory stuff, Heat colors for the prediction models (to show intensity), and Magma for the SMOTE comparison.
 
----
+## Running It Locally
 
-## 📚 Key Findings
+The app loads your data from the CSV files in the `dataset_diabetes/` folder and does all computations on the fly. First load might take 30-60 seconds while it builds the models, but after that it's responsive.
 
-| Metric | Before SMOTE | After SMOTE | Change |
-|--------|------------|-----------|--------|
-| ROC-AUC | 0.78 | 0.87 | +9% |
-| Sensitivity | 42.7% | 82.1% | +39% |
-| Specificity | 96.8% | 80.7% | -16% |
+## Files
 
-**Interpretation**: SMOTE essential for clinical deployment - dramatically improves detection of readmission risk while maintaining reasonable specificity.
+- `app.R` - The actual dashboard
+- `Project.Rmd` - The original analysis where I worked through all this
+- `dataset_diabetes/` - The actual data files
 
----
+## Notes
 
-## 💡 Clinical Recommendations
+All patient identifiers have been stripped out, so this is a de-identified dataset. It's a good benchmark for diabetes research.
 
-1. **Monitoring**: Track HbA1c between encounters for early intervention
-2. **Screening**: Use competing risks model for complication risk assessment
-3. **Risk Stratification**: Deploy SMOTE-trained XGBoost for readmission prediction
-4. **Personalization**: Integrate predictive scores with clinical judgment
-
----
-
-## 📁 File Structure
-
-```
-├── app.R                          # Main Shiny dashboard
-├── README.md                      # This file
-├── Project.Rmd                    # Original analysis code
-├── dataset_diabetes/
-│   ├── diabetic_data.csv
-│   └── IDs_mapping.csv
-└── cumulative_incidence_competing_risks.png
-```
-
----
-
-## 🎨 Color Schemes
-
-- **Data Exploration**: RColorBrewer Blues
-- **RQ3 (Prediction)**: RColorBrewer Heat (YlOrRd)
-- **SMOTE Analysis**: Viridis Magma
-
----
-
-## 📖 Documentation
-
-Comprehensive documentation available in the dashboard:
-- **Overview Tab**: Detailed project description & methods
-- **Each Analysis Tab**: Method explanation & interpretation
-- **Summary Tab**: Clinical implications & recommendations
-
----
-
-## 🔐 Privacy
-
-All patient identifiers removed - HIPAA compliant, de-identified benchmark dataset.
-
----
-
-## 📝 Citation
-
-```
-Pawar, D. (2025). Disease Progression Analytics and Dynamic Risk Prediction 
-of Diabetic Complications Using Longitudinal Electronic Health Records.
-```
-
----
-
-## 👤 Author
-
-**Devashree Pawar** | BIOS Project, 2025
-
----
-
-## 📞 Support
-
-For questions, refer to:
-- **Dashboard**: Overview tab has detailed project description
-- **Methods**: Project.Rmd file contains original analysis code
-- **Interpretation**: Summary tab provides clinical context
-
----
-
-**Last Updated**: May 5, 2026
+If you want to understand the details better, check out the Project.Rmd file where I documented everything as I went.
